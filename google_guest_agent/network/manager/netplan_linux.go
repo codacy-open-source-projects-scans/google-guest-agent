@@ -97,7 +97,7 @@ type netplanEthernet struct {
 type netplanDHCPOverrides struct {
 	// When true, the domain name received from the DHCP server will be used as DNS
 	// search domain over this link.
-	UseDomains bool `yaml:"use-domains,omitempty"`
+	UseDomains *bool `yaml:"use-domains,omitempty"`
 }
 
 // netplanMatch contains the keys uses to match an interface.
@@ -181,15 +181,6 @@ func (n netplan) SetupEthernetInterface(ctx context.Context, config *cfg.Section
 		return fmt.Errorf("error writing systemd-networkd's drop-in: %v", err)
 	}
 
-	osInfo := osinfoGet()
-	// Debian 12 has a pretty generic matching netplan configuration for gce, until we have that
-	// changed we are only removing.
-	if osInfo.OS == "debian" && osInfo.Version.Major == 12 {
-		if err := os.Remove("/etc/netplan/90-default.yaml"); err != nil {
-			logger.Debugf("Failed to remove default netplan config: %s", err)
-		}
-	}
-
 	// Avoid restarting systemd-networkd.
 	if err := run.Quiet(ctx, "networkctl", "reload"); err != nil {
 		return fmt.Errorf("error reloading systemd-networkd network configs: %v", err)
@@ -216,6 +207,9 @@ func (n netplan) writeNetworkdDropin(interfaces, ipv6Interfaces []string) error 
 	}
 
 	for i, iface := range interfaces {
+		if !shouldManageInterface(i == 0) {
+			continue
+		}
 		logger.Debugf("writing systemd-networkd drop-in config for %s", iface)
 
 		var dhcp = "ipv4"
@@ -283,6 +277,12 @@ func (nd networkdNetplanDropin) write(n netplan, iface string) error {
 	return nil
 }
 
+// shouldUseDomains returns true if interface index is 0.
+func shouldUseDomains(idx int) *bool {
+	res := idx == 0
+	return &res
+}
+
 // writeNetplanEthernetDropin selects the ethernet configuration, transforms it
 // into a netplan dropin format and writes it down to the netplan's drop-in directory.
 func (n netplan) writeNetplanEthernetDropin(mtuMap map[string]int, interfaces, ipv6Interfaces []string) error {
@@ -294,6 +294,9 @@ func (n netplan) writeNetplanEthernetDropin(mtuMap map[string]int, interfaces, i
 	}
 
 	for i, iface := range interfaces {
+		if !shouldManageInterface(i == 0) {
+			continue
+		}
 		logger.Debugf("Adding %s(%d) to drop-in configuration.", iface, i)
 
 		trueVal := true
@@ -301,7 +304,7 @@ func (n netplan) writeNetplanEthernetDropin(mtuMap map[string]int, interfaces, i
 			Match:  netplanMatch{Name: iface},
 			DHCPv4: &trueVal,
 			DHCP4Overrides: &netplanDHCPOverrides{
-				UseDomains: true,
+				UseDomains: shouldUseDomains(i),
 			},
 		}
 
@@ -312,7 +315,7 @@ func (n netplan) writeNetplanEthernetDropin(mtuMap map[string]int, interfaces, i
 		if slices.Contains(ipv6Interfaces, iface) {
 			ne.DHCPv6 = &trueVal
 			ne.DHCP6Overrides = &netplanDHCPOverrides{
-				UseDomains: true,
+				UseDomains: shouldUseDomains(i),
 			}
 		}
 
@@ -329,6 +332,12 @@ func (n netplan) writeNetplanEthernetDropin(mtuMap map[string]int, interfaces, i
 // write writes the netplan dropin file.
 func (n netplan) write(nd netplanDropin, suffix string) error {
 	dropinFile := n.dropinFile(suffix)
+	dropinDir := filepath.Dir(dropinFile)
+	err := os.MkdirAll(dropinDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create networkd dropin dir: %w", err)
+	}
+
 	if err := writeYamlFile(dropinFile, &nd); err != nil {
 		return fmt.Errorf("error saving netplan drop-in file %s: %w", dropinFile, err)
 	}
@@ -421,6 +430,13 @@ func (n netplan) Rollback(ctx context.Context, nics *Interfaces) error {
 				logger.Debugf("No such drop-in file(%s), ignoring.", configFile)
 			}
 		}
+	}
+
+	if err := run.Quiet(ctx, "networkctl", "reload"); err != nil {
+		return fmt.Errorf("error reloading systemd-networkd network configs: %v", err)
+	}
+	if err := run.Quiet(ctx, "netplan", "apply"); err != nil {
+		return fmt.Errorf("error applying netplan changes: %w", err)
 	}
 
 	return nil
