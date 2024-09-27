@@ -272,21 +272,10 @@ func (n *systemdNetworkd) SetupEthernetInterface(ctx context.Context, config *cf
 // SetupVlanInterface writes the apppropriate vLAN interfaces configuration for the network manager service
 // for all configured interfaces.
 func (n *systemdNetworkd) SetupVlanInterface(ctx context.Context, config *cfg.Sections, nics *Interfaces) error {
-	// Retrieves the ethernet nics so we can detect the parent one.
-	googleInterfaces, err := interfaceNames(nics.EthernetInterfaces)
-	if err != nil {
-		return fmt.Errorf("could not list interfaces names: %+v", err)
-	}
-
 	var keepMe []string
 
 	for _, curr := range nics.VlanInterfaces {
-		parentInterface, err := vlanParentInterface(googleInterfaces, curr)
-		if err != nil {
-			return fmt.Errorf("failed to determine vlan's parent interface: %+v", err)
-		}
-
-		iface := fmt.Sprintf("gcp.%s.%d", parentInterface, curr.Vlan)
+		iface := fmt.Sprintf("gcp.%s.%d", curr.ParentInterfaceID, curr.Vlan)
 
 		// Create and setup .network file.
 		networkConfig := systemdConfig{
@@ -330,7 +319,7 @@ func (n *systemdNetworkd) SetupVlanInterface(ctx context.Context, config *cfg.Se
 		}
 
 		// Add VLAN keys to the VLAN's parent .network config file.
-		parentFile := n.networkFile(parentInterface)
+		parentFile := n.networkFile(curr.ParentInterfaceID)
 		parentConfig := new(systemdConfig)
 
 		if err := readIniFile(parentFile, parentConfig); err != nil {
@@ -341,7 +330,7 @@ func (n *systemdNetworkd) SetupVlanInterface(ctx context.Context, config *cfg.Se
 		if !slices.Contains(parentConfig.Network.VLANS, iface) {
 			parentConfig.Network.VLANS = append(parentConfig.Network.VLANS, iface)
 
-			if err := parentConfig.write(n, parentInterface); err != nil {
+			if err := parentConfig.write(n, curr.ParentInterfaceID); err != nil {
 				return fmt.Errorf("error writing vlan parent's .network config: %+v", err)
 			}
 		}
@@ -550,8 +539,22 @@ func (n *systemdNetworkd) writeEthernetConfig(interfaces, ipv6Interfaces []strin
 	return nil
 }
 
-// Rollback deletes the configuration files created by the agent for systemd-networkd.
+// Rollback deletes the configuration files created by the agent for
+// systemd-networkd - both regular and vlan nics are handled.
 func (n *systemdNetworkd) Rollback(ctx context.Context, nics *Interfaces) error {
+	return n.rollbackConfigs(ctx, nics, true)
+}
+
+// Rollback deletes the configuration files created by the agent for
+// systemd-networkd - only regular nics are handled.
+func (n *systemdNetworkd) RollbackNics(ctx context.Context, nics *Interfaces) error {
+	return n.rollbackConfigs(ctx, nics, false)
+}
+
+// rollbackConfigs is the low level implementation of Rollback and RollbackNics
+// interface. If removeVlan is true both regular nics and vlan nics are removed
+// otherwise only regular nics are removed.
+func (n *systemdNetworkd) rollbackConfigs(ctx context.Context, nics *Interfaces, removeVlan bool) error {
 	logger.Infof("rolling back changes for %s", n.Name())
 	interfaces, err := interfaceNames(nics.EthernetInterfaces)
 	if err != nil {
@@ -587,10 +590,13 @@ func (n *systemdNetworkd) Rollback(ctx context.Context, nics *Interfaces) error 
 		}
 	}
 
+	vlanRequiresRestart := false
 	// Rollback vlan interfaces.
-	vlanRequiresRestart, err := n.removeVlanInterfaces(nil)
-	if err != nil {
-		logger.Warningf("Failed to rollback vlan interfaces: %v", err)
+	if removeVlan {
+		vlanRequiresRestart, err = n.removeVlanInterfaces(nil)
+		if err != nil {
+			logger.Warningf("Failed to rollback vlan interfaces: %v", err)
+		}
 	}
 
 	if !ethernetRequiresRestart && !vlanRequiresRestart {

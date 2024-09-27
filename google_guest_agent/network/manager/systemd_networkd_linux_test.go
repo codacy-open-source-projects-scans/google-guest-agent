@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/go-ini/ini"
@@ -429,6 +430,10 @@ func TestSystemdNetworkdIsManaging(t *testing.T) {
 
 // TestSystemdNetworkdConfig tests whether config file writing works correctly.
 func TestSystemdNetworkdConfig(t *testing.T) {
+	if err := cfg.Load(nil); err != nil {
+		t.Fatalf("cfg.Load(nil) failed unexpectedly with error: %v", err)
+	}
+
 	tests := []struct {
 		// name is the name of the test.
 		name string
@@ -439,25 +444,34 @@ func TestSystemdNetworkdConfig(t *testing.T) {
 		// testIpv6Interfaces is the list of mock IPv6 interfaces.
 		testIpv6Interfaces []string
 
+		// wantInterfaces is the list of test interfaces expected in output.
+		wantInterfaces []string
+
 		// expectedFiles is the list of expected file names.
 		expectedFiles []string
 
 		// expectedDHCP is the list of expected DHCP values.
 		expectedDHCP []string
+
+		// should manage primary nic interface.
+		managePrimary bool
 	}{
 		{
 			name:           "ipv4",
 			testInterfaces: []string{"iface0"},
+			wantInterfaces: []string{"iface0"},
 			expectedFiles: []string{
 				"1-iface0-google-guest-agent.network",
 			},
 			expectedDHCP: []string{
 				"ipv4",
 			},
+			managePrimary: true,
 		},
 		{
 			name:               "ipv6",
 			testInterfaces:     []string{"iface0"},
+			wantInterfaces:     []string{"iface0"},
 			testIpv6Interfaces: []string{"iface0"},
 			expectedFiles: []string{
 				"1-iface0-google-guest-agent.network",
@@ -465,10 +479,12 @@ func TestSystemdNetworkdConfig(t *testing.T) {
 			expectedDHCP: []string{
 				"yes",
 			},
+			managePrimary: true,
 		},
 		{
 			name:               "multinic",
 			testInterfaces:     []string{"iface0", "iface1"},
+			wantInterfaces:     []string{"iface0", "iface1"},
 			testIpv6Interfaces: []string{"iface1"},
 			expectedFiles: []string{
 				"1-iface0-google-guest-agent.network",
@@ -478,11 +494,26 @@ func TestSystemdNetworkdConfig(t *testing.T) {
 				"ipv4",
 				"yes",
 			},
+			managePrimary: true,
+		},
+		{
+			name:               "multinic_no_primary",
+			testInterfaces:     []string{"iface0", "iface1"},
+			wantInterfaces:     []string{"iface1"},
+			testIpv6Interfaces: []string{"iface1"},
+			expectedFiles: []string{
+				"1-iface1-google-guest-agent.network",
+			},
+			expectedDHCP: []string{
+				"yes",
+			},
+			managePrimary: false,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			cfg.Get().NetworkInterfaces.ManagePrimaryNIC = test.managePrimary
 			systemdTestSetup(t, systemdTestOpts{})
 
 			if err := mockSystemd.writeEthernetConfig(test.testInterfaces, test.testIpv6Interfaces); err != nil {
@@ -524,10 +555,10 @@ func TestSystemdNetworkdConfig(t *testing.T) {
 				}
 
 				// Check that the file matches the interface.
-				if sections.Match.Name != test.testInterfaces[i] {
+				if sections.Match.Name != test.wantInterfaces[i] {
 					t.Errorf(`%s does not have correct match.
 						Expected: %s
-						Actual: %s`, file.Name(), test.testInterfaces[i], sections.Match.Name)
+						Actual: %s`, file.Name(), test.wantInterfaces[i], sections.Match.Name)
 				}
 
 				// Make sure the DHCP section is set correctly.
@@ -558,6 +589,7 @@ func TestSetupVlanInterfaceSuccess(t *testing.T) {
 
 	tests := []struct {
 		ethernetInterface metadata.NetworkInterfaces
+		parentID          string
 		vlanInterface     metadata.VlanInterface
 	}{
 		{
@@ -566,6 +598,7 @@ func TestSetupVlanInterfaceSuccess(t *testing.T) {
 				ParentInterface: "/computeMetadata/v1/instance/network-interfaces/0/",
 				Vlan:            22,
 			},
+			parentID: ifaces[1].Name,
 			ethernetInterface: metadata.NetworkInterfaces{
 				Mac: ifaces[1].HardwareAddr.String(),
 			},
@@ -576,6 +609,7 @@ func TestSetupVlanInterfaceSuccess(t *testing.T) {
 				ParentInterface: "/computeMetadata/v1/instance/network-interfaces/0/",
 				Vlan:            33,
 			},
+			parentID: ifaces[1].Name,
 			ethernetInterface: metadata.NetworkInterfaces{
 				Mac: ifaces[1].HardwareAddr.String(),
 			},
@@ -615,8 +649,8 @@ func TestSetupVlanInterfaceSuccess(t *testing.T) {
 
 			nics := &Interfaces{
 				EthernetInterfaces: []metadata.NetworkInterfaces{curr.ethernetInterface},
-				VlanInterfaces: map[int]metadata.VlanInterface{
-					curr.vlanInterface.Vlan: curr.vlanInterface,
+				VlanInterfaces: map[int]VlanInterface{
+					curr.vlanInterface.Vlan: {VlanInterface: curr.vlanInterface, ParentInterfaceID: curr.parentID},
 				},
 			}
 
@@ -661,92 +695,6 @@ func TestSetupVlanInterfaceSuccess(t *testing.T) {
 
 			fileExists(networkFile, false)
 			fileExists(netdevFile, false)
-		})
-	}
-}
-
-func TestSetupVlanInterfaceFailure(t *testing.T) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		t.Fatalf("could not list local interfaces: %+v", err)
-	}
-
-	tests := []struct {
-		ethernetInterface metadata.NetworkInterfaces
-		vlanInterface     metadata.VlanInterface
-	}{
-		{
-			vlanInterface: metadata.VlanInterface{
-				Mac:             "foobar",
-				ParentInterface: "/computeMetadata/v1/instance/network-interfaces/x/",
-				Vlan:            33,
-			},
-			ethernetInterface: metadata.NetworkInterfaces{
-				Mac: ifaces[1].HardwareAddr.String(),
-			},
-		},
-		{
-			vlanInterface: metadata.VlanInterface{
-				Mac:             "foobar",
-				ParentInterface: "/computeMetadata/v1/instance/network-interfaces/1/",
-				Vlan:            11,
-			},
-			ethernetInterface: metadata.NetworkInterfaces{
-				Mac: ifaces[1].HardwareAddr.String(),
-			},
-		},
-		{
-			vlanInterface: metadata.VlanInterface{
-				Mac:             "foobar",
-				ParentInterface: "/computeMetadata/v1/instance/network-interfaces/0/",
-				Vlan:            22,
-			},
-			ethernetInterface: metadata.NetworkInterfaces{
-				Mac: "foo-bar",
-			},
-		},
-	}
-
-	opts := systemdTestOpts{
-		lookPathOpts: systemdLookPathOpts{
-			returnValue: true,
-		},
-		runnerOpts: systemdRunnerOpts{
-			versionOpts: systemdVersionOpts{
-				version: 300,
-			},
-			statusOpts: systemdStatusOpts{
-				returnValue:   true,
-				hasKey:        true,
-				configuredKey: "SetupState",
-			},
-		}}
-
-	for i, curr := range tests {
-		t.Run(fmt.Sprintf("test-setup-vlan-success-%d", i), func(t *testing.T) {
-			impl := &systemdNetworkd{
-				configDir:      t.TempDir(),
-				networkCtlKeys: []string{"AdministrativeState", "SetupState"},
-				priority:       1,
-			}
-
-			systemdTestSetup(t, opts)
-
-			t.Cleanup(func() {
-				dhclientTestTearDown(t)
-			})
-
-			nics := &Interfaces{
-				EthernetInterfaces: []metadata.NetworkInterfaces{curr.ethernetInterface},
-				VlanInterfaces: map[int]metadata.VlanInterface{
-					curr.vlanInterface.Vlan: curr.vlanInterface,
-				},
-			}
-
-			ctx := context.Background()
-			if err := impl.SetupVlanInterface(ctx, nil, nics); err == nil {
-				t.Fatal("expected err: non-nill, got: nil")
-			}
 		})
 	}
 }

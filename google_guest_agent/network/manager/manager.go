@@ -20,10 +20,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
+	"github.com/GoogleCloudPlatform/guest-agent/utils"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 )
 
@@ -50,6 +52,9 @@ type Service interface {
 
 	// Rollback rolls back the changes created in Setup.
 	Rollback(ctx context.Context, nics *Interfaces) error
+
+	// RollbackNics rolls back only changes to regular nics (vlan nics are not handled).
+	RollbackNics(ctx context.Context, nics *Interfaces) error
 }
 
 // serviceStatus is an internal wrapper of a service implementation and its status.
@@ -60,13 +65,23 @@ type serviceStatus struct {
 	active bool
 }
 
+// VlanInterface are [metadata.VlanInterface] offered by MDS with derived Parent Interface
+// name added to it for convenience.
+type VlanInterface struct {
+	metadata.VlanInterface
+	// ParentInterfaceID is the interface name on the host. All network managers should refer
+	// this interface name instead of one present in [metadata.VlanInterface] which is just an
+	// index to interface in [EthernetInterfaces]
+	ParentInterfaceID string
+}
+
 // Interfaces wraps both ethernet and vlan interfaces.
 type Interfaces struct {
 	// EthernetInterfaces are the regular ethernet interfaces descriptors offered by metadata.
 	EthernetInterfaces []metadata.NetworkInterfaces
 
 	// VlanInterfaces are the vLAN interfaces descriptors offered by metadata.
-	VlanInterfaces map[int]metadata.VlanInterface
+	VlanInterfaces map[int]VlanInterface
 }
 
 // guestAgentSection is the section added to guest-agent-written ini files to indicate
@@ -77,7 +92,30 @@ type guestAgentSection struct {
 }
 
 const (
-	googleComment = "# Added by Google Compute Engine Guest Agent."
+	googleComment         = "# Added by Google Compute Engine Guest Agent."
+	debian12NetplanFile   = "/etc/netplan/90-default.yaml"
+	debian12NetplanConfig = `network:
+    version: 2
+    ethernets:
+        all-en:
+            match:
+                name: en*
+            dhcp4: true
+            dhcp4-overrides:
+                use-domains: true
+            dhcp6: true
+            dhcp6-overrides:
+                use-domains: true
+        all-eth:
+            match:
+                name: eth*
+            dhcp4: true
+            dhcp4-overrides:
+                use-domains: true
+            dhcp6: true
+            dhcp6-overrides:
+                use-domains: true
+`
 )
 
 var (
@@ -110,6 +148,21 @@ func detectNetworkManager(ctx context.Context, iface string) (*serviceStatus, er
 	return nil, fmt.Errorf("no network manager impl found for %s", iface)
 }
 
+// reformatVlanNics reads VLAN NIC information from metadata descriptor and formats
+// it into [Interfaces.VlanInterfaces] that every network manager understands.
+func reformatVlanNics(mds *metadata.Descriptor, nics *Interfaces, ethernetInterfaces []string) error {
+	for parentID, vlans := range mds.Instance.VlanNetworkInterfaces {
+		if parentID >= len(ethernetInterfaces) {
+			return fmt.Errorf("invalid parent index(%d), known interfaces count: %d", parentID, len(ethernetInterfaces))
+		}
+
+		for vlanID, vlan := range vlans {
+			nics.VlanInterfaces[vlanID] = VlanInterface{VlanInterface: vlan, ParentInterfaceID: ethernetInterfaces[parentID]}
+		}
+	}
+	return nil
+}
+
 // SetupInterfaces sets up all secondary network interfaces on the system, and primary network
 // interface if enabled in the configuration using the native network manager service detected
 // to be managing the primary network interface.
@@ -122,13 +175,7 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, mds *metadata.De
 
 	nics := &Interfaces{
 		EthernetInterfaces: mds.Instance.NetworkInterfaces,
-		VlanInterfaces:     map[int]metadata.VlanInterface{},
-	}
-
-	for _, curr := range mds.Instance.VlanNetworkInterfaces {
-		for key, val := range curr {
-			nics.VlanInterfaces[key] = val
-		}
+		VlanInterfaces:     map[int]VlanInterface{},
 	}
 
 	interfaces, err := interfaceNames(nics.EthernetInterfaces)
@@ -141,6 +188,24 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, mds *metadata.De
 	activeService, err := detectNetworkManager(ctx, primaryInterface)
 	if err != nil {
 		return fmt.Errorf("error detecting network manager service: %v", err)
+	}
+
+	// Remove only primary nics left over configs.
+	if !config.NetworkInterfaces.ManagePrimaryNIC {
+		primaryInterface := mds.Instance.NetworkInterfaces[0]
+		nic := &Interfaces{
+			EthernetInterfaces: []metadata.NetworkInterfaces{primaryInterface},
+		}
+
+		for _, svc := range knownNetworkManagers {
+			if err := svc.RollbackNics(ctx, nic); err != nil {
+				logger.Errorf("Failed to rollback primary nic (left over) config for %s: %v", svc.Name(), err)
+			}
+		}
+	}
+
+	if err := restoreDebian12NetplanConfig(config); err != nil {
+		logger.Errorf("Failed to restore debian-12 netplan configuration: %v", err)
 	}
 
 	// Attempt to rollback any left over configuration of non active network managers.
@@ -165,12 +230,46 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, mds *metadata.De
 	}
 
 	if config.Unstable.VlanSetupEnabled {
+		logger.Infof("VLAN setup is enabled via config file, setting up interfaces")
+		if err := reformatVlanNics(mds, nics, interfaces); err != nil {
+			return fmt.Errorf("unable to read vlans, invalid format: %w", err)
+		}
 		if err = activeService.manager.SetupVlanInterface(ctx, config, nics); err != nil {
 			return fmt.Errorf("manager(%s): error setting up vlan interfaces: %v", activeService.manager.Name(), err)
 		}
 	}
 
 	logger.Infof("Finished setting up %s", activeService.manager.Name())
+
+	return nil
+}
+
+// restoreDebian12NetplanConfig recreates the default netplan configuration
+// for debian-12 in case user hasn't disabled it and the running system is
+// indeed a debian-12 system.
+func restoreDebian12NetplanConfig(config *cfg.Sections) error {
+	if !config.NetworkInterfaces.RestoreDebian12NetplanConfig {
+		logger.Debugf("User provided configuration requested to skip debian-12 netplan configuration")
+		return nil
+	}
+
+	osDesc := osinfo.Get()
+	if osDesc.OS != "debian" || osDesc.Version.Major != 12 {
+		logger.Debugf("Not running a debian-12 system, skipping netplan configuration restore")
+		return nil
+	}
+
+	if _, err := os.Stat(debian12NetplanFile); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+
+		if err := utils.WriteFile([]byte(debian12NetplanConfig), debian12NetplanFile, 0644); err != nil {
+			return fmt.Errorf("Failed to recreate default netplan config: %w", err)
+		}
+
+		logger.Debugf("Recreated default netplan config...")
+	}
 
 	return nil
 }
@@ -198,7 +297,7 @@ func FallbackToDefault(ctx context.Context) error {
 func buildInterfacesFromAllPhysicalNICs() (*Interfaces, error) {
 	nics := &Interfaces{
 		EthernetInterfaces: nil,
-		VlanInterfaces:     map[int]metadata.VlanInterface{},
+		VlanInterfaces:     map[int]VlanInterface{},
 	}
 
 	interfaces, err := net.Interfaces()

@@ -19,15 +19,20 @@ package manager
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
+	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/go-ini/ini"
+	"github.com/google/go-cmp/cmp"
 )
 
 var (
@@ -305,6 +310,10 @@ func TestNetworkManagerIsManaging(t *testing.T) {
 // TestWriteNetworkManagerConfigs tests whether writeNetworkManagerConfigs() correclty writes
 // the connection files to the correct place and contain the correct contents.
 func TestWriteNetworkManagerConfigs(t *testing.T) {
+	if err := cfg.Load(nil); err != nil {
+		t.Fatalf("cfg.Load(nil) failed unexpectedly with error: %v", err)
+	}
+
 	tests := []struct {
 		// name is the name of this test.
 		name string
@@ -312,25 +321,34 @@ func TestWriteNetworkManagerConfigs(t *testing.T) {
 		// testInterfaces is the list of test interfaces.
 		testInterfaces []string
 
+		// wantInterfaces is the list of test interfaces expected in output.
+		wantInterfaces []string
+
 		// expectedIDs is the list of expected IDs.
 		expectedIDs []string
 
 		// expectedFiles is the list of expected files.
 		expectedFiles []string
+
+		// should manage primary nic interface.
+		managePrimary bool
 	}{
 		// One interface.
 		{
 			name:           "one-nic",
 			testInterfaces: []string{"iface"},
+			wantInterfaces: []string{"iface"},
 			expectedIDs:    []string{"google-guest-agent-iface"},
 			expectedFiles: []string{
 				"google-guest-agent-iface.nmconnection",
 			},
+			managePrimary: true,
 		},
 		// Multiple interfaces.
 		{
 			name:           "multinic",
 			testInterfaces: []string{"iface0", "iface1", "iface2"},
+			wantInterfaces: []string{"iface0", "iface1", "iface2"},
 			expectedIDs: []string{
 				"google-guest-agent-iface0",
 				"google-guest-agent-iface1",
@@ -341,12 +359,28 @@ func TestWriteNetworkManagerConfigs(t *testing.T) {
 				"google-guest-agent-iface1.nmconnection",
 				"google-guest-agent-iface2.nmconnection",
 			},
+			managePrimary: true,
+		},
+		{
+			name:           "multinic_no_primary",
+			testInterfaces: []string{"iface0", "iface1", "iface2"},
+			wantInterfaces: []string{"iface1", "iface2"},
+			expectedIDs: []string{
+				"google-guest-agent-iface1",
+				"google-guest-agent-iface2",
+			},
+			expectedFiles: []string{
+				"google-guest-agent-iface1.nmconnection",
+				"google-guest-agent-iface2.nmconnection",
+			},
+			managePrimary: false,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			nmTestSetup(t, nmTestOpts{})
+			cfg.Get().NetworkInterfaces.ManagePrimaryNIC = test.managePrimary
 
 			configDir := path.Join(t.TempDir(), "system-connections")
 			if err := os.MkdirAll(configDir, 0755); err != nil {
@@ -360,8 +394,8 @@ func TestWriteNetworkManagerConfigs(t *testing.T) {
 			}
 
 			for i, conn := range conns {
-				if conn != test.testInterfaces[i] {
-					t.Fatalf("unexpected connection interface. Expected: %s, Actual: %s", test.testInterfaces[i], conn)
+				if conn != test.wantInterfaces[i] {
+					t.Fatalf("unexpected connection interface. Expected: %s, Actual: %s", test.wantInterfaces[i], conn)
 				}
 
 				// Load the file and check the sections.
@@ -389,12 +423,85 @@ func TestWriteNetworkManagerConfigs(t *testing.T) {
 					t.Fatalf("unexpected connection id. Expected: %v, Actual: %v", test.expectedIDs[i], config.Connection.ID)
 				}
 
-				if config.Connection.InterfaceName != test.testInterfaces[i] {
-					t.Fatalf("unexpected interface name. Expected: %v, Actual: %v", test.testInterfaces[i], config.Connection.InterfaceName)
+				if config.Connection.InterfaceName != test.wantInterfaces[i] {
+					t.Fatalf("unexpected interface name. Expected: %v, Actual: %v", test.wantInterfaces[i], config.Connection.InterfaceName)
 				}
 			}
 
 			nmTestTearDown(t)
 		})
 	}
+}
+
+func TestVlanInterface(t *testing.T) {
+	ctx := context.Background()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("could not list local interfaces: %+v", err)
+	}
+
+	interfaceName := ifaces[1].Name
+
+	validNics := &Interfaces{
+		EthernetInterfaces: []metadata.NetworkInterfaces{{
+			Mac: ifaces[1].HardwareAddr.String(),
+		}},
+		VlanInterfaces: map[int]VlanInterface{
+			22: {
+				VlanInterface: metadata.VlanInterface{
+					Mac:             "foobar",
+					ParentInterface: "/computeMetadata/v1/instance/network-interfaces/0/",
+					Vlan:            22,
+					MTU:             1460,
+				},
+				ParentInterfaceID: ifaces[1].Name,
+			},
+		},
+	}
+
+	wantCfg := &nmConfig{
+		GuestAgent: guestAgentSection{ManagedByGuestAgent: true},
+		Connection: nmConnectionSection{
+			InterfaceName: fmt.Sprintf("gcp.%s.22", interfaceName),
+			ID:            fmt.Sprintf("google-guest-agent-gcp.%s.22", interfaceName),
+			ConnType:      "vlan",
+		},
+		Ipv4:     nmIPv4Section{Method: "auto"},
+		Ipv6:     nmIPv6Section{Method: "auto", MTU: 1460},
+		Vlan:     &nmVlan{Flags: 1, ID: 22, Parent: interfaceName},
+		Ethernet: &nmEthernet{OverrideMacAddress: "foobar", MTU: 1460},
+	}
+
+	nmTestSetup(t, nmTestOpts{})
+	configDir := filepath.Join(t.TempDir(), "system-connections")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+
+	testNetworkManager.configDir = configDir
+
+	if err := testNetworkManager.SetupVlanInterface(ctx, nil, validNics); err != nil {
+		t.Fatalf("testNetworkManager.SetupVlanInterface(ctx, nil, %+v) = err [%v], want error: nil", validNics, err)
+	}
+
+	name := testNetworkManager.vlanInterfaceName(interfaceName, 22)
+	cfgFile := testNetworkManager.networkManagerConfigFilePath(name)
+	nmCfg := new(nmConfig)
+
+	if err := readIniFile(cfgFile, nmCfg); err != nil {
+		t.Fatalf("readIniFile(%s, nmConfig) failed unexpectedly with error: %v", cfgFile, err)
+	}
+
+	if diff := cmp.Diff(wantCfg, nmCfg); diff != "" {
+		t.Errorf("SetupVlanInterface returned unexpected diff (-want,+got)\n%s", diff)
+	}
+
+	if err := testNetworkManager.Rollback(ctx, validNics); err != nil {
+		t.Fatalf("testNetworkManager.Rollback(ctx, %+v) failed unexpectedly with error: %v", validNics, err)
+	}
+
+	if _, err := os.Stat(cfgFile); err == nil {
+		t.Errorf("testNetworkManager.Rollback(ctx, %+v) did not remove %q", validNics, cfgFile)
+	}
+
 }
