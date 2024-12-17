@@ -51,8 +51,7 @@ function Set-New-Service($service_name, $service_display_name, $service_desc, $s
                 -BinaryPathName $service_binary `
                 -StartupType Automatic `
                 -Description $service_desc
-  } 
-  else {
+  } else {
     Set-Service -Name $service_name `
                 -DisplayName $service_display_name `
                 -Description $service_desc
@@ -77,6 +76,11 @@ try {
   if ($install_manager) {
     Set-New-Service $manager_name $manager_display_name $manager_description $manager_path
     Set-ServiceConfig $manager_name $manager_path
+  } else {
+    if (Get-Service $manager_name -ErrorAction SilentlyContinue) {
+      Stop-Service $manager_name
+      & sc.exe delete $manager_name
+    }
   }
 
   $config = "${env:ProgramFiles}\Google\Compute Engine\instance_configs.cfg"

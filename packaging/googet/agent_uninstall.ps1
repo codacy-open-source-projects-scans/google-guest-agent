@@ -20,3 +20,4 @@ if (Get-Service $name -ErrorAction SilentlyContinue) {
     Stop-Service $name -Verbose
     & sc.exe delete $name
 }
+
