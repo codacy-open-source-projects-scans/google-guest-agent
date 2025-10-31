@@ -1,0 +1,6 @@
+disable google-guest-agent.service
+enable google-shutdown-scripts.service
+enable google-startup-scripts.service
+disable gce-workload-cert-refresh.timer
+enable google-guest-compat-manager.service
+enable google-guest-agent-manager.service
